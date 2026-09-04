@@ -1,10 +1,10 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -g
 
-server: server.c 
-	$(CC) $(CFLAGS) -o server server.c 
+server: cserver.c 
+	$(CC) $(CFLAGS) -o cserver cserver.c 
 
 clean:
-	rm -rf server
+	rm -rf cserver
 
 .PHONY: clean

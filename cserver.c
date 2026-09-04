@@ -38,7 +38,6 @@ int main(void) {
     printf("Listening on http://localhost:%d\n", PORT);
 
     // A valid minimal HTTP/1.1 response
-
     const char *response = 
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/plain\r\n"
@@ -47,6 +46,7 @@ int main(void) {
         "\r\n"
         "Hello, world!";
 
+        
         for (;;) {
             struct sockaddr_in client_addr;
             socklen_t client_len = sizeof(client_addr);
