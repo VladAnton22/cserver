@@ -33,7 +33,7 @@ Then:
 curl -v localhost:8080/
 ```
 
-**Requirements:** Linux (uses `epoll`), `gcc`, `make`.
+**Requirements:** Linux (uses `epoll`, `gcc`, `make`).
 
 ---
 
