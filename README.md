@@ -1,4 +1,4 @@
-# cserve
+# cserver
 
 A hand-written HTTP/1.1 server in C, built from raw sockets - no framework, no HTTP library. Serves static files and a small JSON API over an `epoll`-based event loop.
 
