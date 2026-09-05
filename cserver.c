@@ -9,6 +9,17 @@
 #define PORT 8080
 #define BACKLOG 16
 
+struct request {
+    char method[8];
+    char path[256];
+    char version[16];
+};
+
+int parse_request(const char *buffer, ssize_t buffer_len, struct request *req) {
+    int fields_matched = sscanf(buffer, "%7s %255s %15s", req->method, req->path, req->version);
+    return fields_matched;
+}
+
 int main(void) {
     // Create TCP socket (IPv4, stream = TCP)
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -46,7 +57,7 @@ int main(void) {
         "\r\n"
         "Hello, world!";
 
-        
+        // TODO: single read assumes whole request arrived - fix in Part 6
         for (;;) {
             struct sockaddr_in client_addr;
             socklen_t client_len = sizeof(client_addr);
@@ -56,7 +67,30 @@ int main(void) {
             }
 
             char buf[4096];
-            read(client_fd, buf, sizeof(buf));
+            ssize_t n = read(client_fd, buf, sizeof(buf) - 1);
+            
+            // Check data from read
+            if (n < 0) {
+                perror("read"); 
+                close(client_fd);
+                continue;
+            } 
+            else if (n == 0) {
+                close(client_fd); continue;
+            }
+
+            buf[n] = '\0';  // add null terminator to the end of the message
+
+            struct request parsed_request = {0};
+            int fields_matched = parse_request(buf, n, &parsed_request);
+
+            if (fields_matched != 3) {
+                fprintf(stderr, "malformed request line, got %d fields\n", fields_matched);
+                close(client_fd);
+                continue;
+            }
+
+            printf("%s %s %s\n", parsed_request.method, parsed_request.path, parsed_request.version);
 
             write(client_fd, response, strlen(response));
             close(client_fd);
@@ -64,5 +98,4 @@ int main(void) {
 
         close(listen_fd);
         return 0;
-
 }
