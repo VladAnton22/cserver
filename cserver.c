@@ -6,9 +6,12 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <time.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 #define PORT 8080
 #define BACKLOG 16
+#define WEBROOT "./www"
 
 struct request {
     char method[8];
@@ -72,6 +75,127 @@ void send_response(int client_fd,
     send(client_fd, body, body_len, 0);
 }
 
+void handle_connection(int client_fd) {
+    char buf[4096];
+    ssize_t n = read(client_fd, buf, sizeof(buf) - 1);
+    
+    // Check data from read
+    if (n < 0) {
+        perror("read"); 
+        close(client_fd);
+        return;
+    } 
+    else if (n == 0) {
+        close(client_fd); return;
+    }
+
+    buf[n] = '\0';  // add null terminator to the end of the message
+
+    struct request parsed_request = {0};
+    int fields_matched = parse_request(buf, n, &parsed_request);
+
+    if (fields_matched != 3) {
+        fprintf(stderr, "malformed request line, got %d fields\n", fields_matched);
+        close(client_fd);
+        return;
+    }
+
+    printf("%s %s %s\n", parsed_request.method, parsed_request.path, parsed_request.version);
+    
+    // Clean request path
+    char effective_path[256];
+
+    char *query = strchr(parsed_request.path, '?');
+
+    size_t len;
+
+    if (query != NULL) {
+        len = (size_t)(query - parsed_request.path);
+    } else {
+        len = strlen(parsed_request.path);
+    }
+
+    if (len >= sizeof(effective_path)) {
+        fprintf(stderr, "Path too long\n");
+        close(client_fd);
+        return;
+    }
+
+    memcpy(effective_path, parsed_request.path, len);
+    effective_path[len] = '\0';
+
+    if (strcmp(effective_path, "/") == 0) {
+        strcpy(effective_path, "/index.html");
+    }
+
+    char filepath[512];
+
+    int chars_written = snprintf(filepath, sizeof(filepath), "%s%s", WEBROOT, effective_path);
+
+    if (chars_written < 0 || (size_t)chars_written >= sizeof(filepath)) {
+        fprintf(stderr, "File path too long\n");
+        close(client_fd);
+        return;
+    }
+
+    int fd = open(filepath, O_RDONLY);
+    if (fd < 0) {
+        send_response(client_fd, 404, "text/html", "404 Not Found", 13);
+        close(client_fd);
+        return;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        perror("fstat");
+        close(fd);
+        close(client_fd);
+        return;
+    }
+    // Check if it is a regular file
+    if (!S_ISREG(st.st_mode)) {
+        send_response(client_fd, 404, "text/html", "404 Not Found", 13);
+        close(fd);
+        close(client_fd);
+        return;
+    }
+
+    // Read file
+    char *filebuf = malloc(st.st_size);
+    if (filebuf == NULL) {
+        perror("malloc");
+        close(fd);
+        close(client_fd);
+        return;
+    }
+
+    size_t total_read = 0;
+
+    while(total_read < (size_t)st.st_size) {
+        ssize_t bytes = read(fd, filebuf + total_read, st.st_size - total_read);
+        if (bytes < 0) {
+            perror("read");
+            break;
+        }
+        if (bytes == 0) {
+            break;
+        }
+        total_read += bytes;
+    }
+    if (total_read != (size_t)st.st_size) {
+        fprintf(stderr, "incomplete read of %s\n", filepath);
+        free(filebuf);
+        close(fd);
+        close(client_fd);
+        return;
+    }
+
+    send_response(client_fd, 200, "text/html", filebuf, st.st_size);
+    free(filebuf);
+    close(fd);
+    close(client_fd);
+}
+
 int main(void) {
     // Create TCP socket (IPv4, stream = TCP)
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -108,43 +232,7 @@ int main(void) {
         if (client_fd < 0) {
             perror("accept"); continue;
         }
-
-        char buf[4096];
-        ssize_t n = read(client_fd, buf, sizeof(buf) - 1);
-        
-        // Check data from read
-        if (n < 0) {
-            perror("read"); 
-            close(client_fd);
-            continue;
-        } 
-        else if (n == 0) {
-            close(client_fd); continue;
-        }
-
-        buf[n] = '\0';  // add null terminator to the end of the message
-
-        struct request parsed_request = {0};
-        int fields_matched = parse_request(buf, n, &parsed_request);
-
-        if (fields_matched != 3) {
-            fprintf(stderr, "malformed request line, got %d fields\n", fields_matched);
-            close(client_fd);
-            continue;
-        }
-
-        printf("%s %s %s\n", parsed_request.method, parsed_request.path, parsed_request.version);
-
-        if (strcmp(parsed_request.path, "/") == 0) {
-            char *body = "<h1>cserver</h1>";
-            send_response(client_fd, 200, "text/html", body, strlen(body));
-        } 
-        else {
-            char *body = "<h1>404 Not Found</h1>";
-            send_response(client_fd, 404, "text/html", body, strlen(body));
-        }
-
-        close(client_fd);
+        handle_connection(client_fd);
     }
 
     close(listen_fd);
