@@ -8,6 +8,7 @@
 #include <time.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <linux/limits.h>
 
 #define PORT 8080
 #define BACKLOG 16
@@ -32,6 +33,8 @@ const char *reason_phrase(int code) {
             return "Forbidden";
         case 404:
             return "Not Found";
+        case 500:
+            return "internal Server Error";
         default:
             return "Unknown";
     }
@@ -138,7 +141,34 @@ void handle_connection(int client_fd) {
         return;
     }
 
-    int fd = open(filepath, O_RDONLY);
+    char resolved[PATH_MAX];
+    char resolved_root[PATH_MAX];
+
+    if (realpath(WEBROOT, resolved_root) == NULL) {
+        perror("realpath webroot");
+        send_response(client_fd, 500, "text/html", "500 Internal Server Error", 25);
+        close(client_fd);
+        return;
+    }
+
+    if (realpath(filepath, resolved) == NULL) {
+        send_response(client_fd, 404, "text/html", "404 Not Found", 13);
+        close(client_fd);
+        return;
+    }
+
+    size_t root_len = strlen(resolved_root);
+
+    if (strncmp(resolved, resolved_root, root_len) != 0 ||
+        (resolved[root_len] != '\0' &&
+         resolved[root_len] != '/')) {
+        send_response(client_fd, 403, "text/html", "403 Forbidden", 13);
+        close(client_fd);
+        return;
+    }
+
+    // Open file
+    int fd = open(resolved, O_RDONLY);
     if (fd < 0) {
         send_response(client_fd, 404, "text/html", "404 Not Found", 13);
         close(client_fd);
@@ -183,7 +213,7 @@ void handle_connection(int client_fd) {
         total_read += bytes;
     }
     if (total_read != (size_t)st.st_size) {
-        fprintf(stderr, "incomplete read of %s\n", filepath);
+        fprintf(stderr, "incomplete read of %s\n", resolved);
         free(filebuf);
         close(fd);
         close(client_fd);
