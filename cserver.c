@@ -170,10 +170,9 @@ void handle_connection(int client_fd) {
     buf[n] = '\0';  // add null terminator to the end of the message
 
     struct request parsed_request = {0};
-    int fields_matched = parse_request(buf, n, &parsed_request);
-
-    if (fields_matched != 3) {
-        fprintf(stderr, "malformed request line, got %d fields\n", fields_matched);
+    int parse_status = parse(buf, n, &parsed_request);
+    if (parse_status != 200) {
+        send_error(client_fd, parse_status);
         close(client_fd);
         return;
     }

@@ -21,6 +21,6 @@ struct request {
     size_t header_count;
 };
 
-int parse_request(const char *buffer, ssize_t buffer_len, struct request *req);
+int parse(const char *buffer, size_t buffer_len, struct request *req);
 
 #endif
