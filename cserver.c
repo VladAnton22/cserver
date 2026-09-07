@@ -9,21 +9,11 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <linux/limits.h>
+#include "http_parser.h"
 
 #define PORT 8080
 #define BACKLOG 16
 #define WEBROOT "./www"
-
-struct request {
-    char method[8];
-    char path[256];
-    char version[16];
-};
-
-int parse_request(const char *buffer, ssize_t buffer_len, struct request *req) {
-    int fields_matched = sscanf(buffer, "%7s %255s %15s", req->method, req->path, req->version);
-    return fields_matched;
-}
 
 const char *reason_phrase(int code) {
     switch (code) {
