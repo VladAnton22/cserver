@@ -34,10 +34,30 @@ const char *reason_phrase(int code) {
         case 404:
             return "Not Found";
         case 500:
-            return "internal Server Error";
+            return "Internal Server Error";
         default:
             return "Unknown";
     }
+}
+
+const char *mime_type(const char *path) {
+    char *last_slash = strrchr(path, '/');
+    char *dot = strrchr(last_slash, '.');
+
+    if (dot == NULL || (last_slash != NULL && dot < last_slash)) {
+        return "application/octet-stream";
+    }
+
+    // MIME Table
+    if (strcmp(dot, ".html") == 0) return "text/html";
+    if (strcmp(dot, ".css") == 0) return "text/css";
+    if (strcmp(dot, ".js") == 0) return "text/javascript";
+    if (strcmp(dot, ".png") == 0) return "image/png";
+    if (strcmp(dot, ".jpg") == 0) return "image/jpg";
+    if (strcmp(dot, ".jpeg") == 0) return "image/jpeg";
+    if (strcmp(dot, ".svg") == 0) return "image/svg+xml";
+    if (strcmp(dot, ".gif") == 0) return "image/gif";
+    return "application/octet-stream";
 }
 
 void send_response(int client_fd,
@@ -220,7 +240,7 @@ void handle_connection(int client_fd) {
         return;
     }
 
-    send_response(client_fd, 200, "text/html", filebuf, st.st_size);
+    send_response(client_fd, 200, mime_type(resolved), filebuf, st.st_size);
     free(filebuf);
     close(fd);
     close(client_fd);
