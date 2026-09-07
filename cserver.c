@@ -29,6 +29,8 @@ const char *reason_phrase(int code) {
     switch (code) {
         case 200:
             return "OK";
+        case 400:
+            return "Bad Request";
         case 403:
             return "Forbidden";
         case 404:
@@ -58,6 +60,48 @@ const char *mime_type(const char *path) {
     if (strcmp(dot, ".svg") == 0) return "image/svg+xml";
     if (strcmp(dot, ".gif") == 0) return "image/gif";
     return "application/octet-stream";
+}
+
+int resolve_path(const char *request_path, char *resolved_out) {
+    // Strip query string
+    char effective_path[256];
+    char *query = strchr(request_path, '?');
+    size_t len = query ? (size_t)(query - request_path) : strlen(request_path);
+    if (len >= sizeof(effective_path)) {
+        return 400;
+    }
+    memcpy(effective_path, request_path, len);
+    effective_path[len] = '\0';
+
+    // Default document
+    if (strcmp(effective_path, "/") == 0) {
+        strcpy(effective_path, "/index.html");
+    }
+
+    // Join with WEBROOT
+    char filepath[512];
+    int written = snprintf(filepath, sizeof(filepath), "%s%s", WEBROOT, effective_path);
+    if (written < 0 || (size_t)written >= sizeof(filepath)) {
+        return 400;
+    }
+
+    // Resolve + traversal check
+    char resolved_root[PATH_MAX];
+    if (realpath(WEBROOT, resolved_root) == NULL) {
+        perror("realpath webroot");
+        return 500;
+    }
+    if (realpath(filepath, resolved_out) == NULL) {
+        return 404;
+    }
+    size_t root_len = strlen(resolved_root);
+    if (strncmp(resolved_out, resolved_root, root_len) != 0 ||
+        (resolved_out[root_len] != '\0' &&
+         resolved_out[root_len] != '/')) {
+        return 403;
+    }
+
+    return 200;
 }
 
 void send_response(int client_fd,
@@ -98,6 +142,27 @@ void send_response(int client_fd,
     send(client_fd, body, body_len, 0);
 }
 
+void send_error(int client_fd, int status_code) {
+    switch (status_code)
+    {
+    case 400:
+        send_response(client_fd, 400, "text/html", "<h1>400 Bad Request</h1>", 24);
+        return;
+    case 403:
+        send_response(client_fd, 403, "text/html", "<h1>403 Forbidden</h1>", 22);
+        return;
+    case 404:
+        send_response(client_fd, 404, "text/html", "<h1>404 Not Found</h1>", 22);
+        return;
+    case 500:
+        send_response(client_fd, 500, "text/html", "<h1>500 Internal Server Error</h1>", 34);
+        return;
+    default:
+        send_response(client_fd, status_code, "text/html", "<h1>Unknown Error</h1>", 22);
+        return;
+    }
+}
+
 void handle_connection(int client_fd) {
     char buf[4096];
     ssize_t n = read(client_fd, buf, sizeof(buf) - 1);
@@ -124,65 +189,12 @@ void handle_connection(int client_fd) {
     }
 
     printf("%s %s %s\n", parsed_request.method, parsed_request.path, parsed_request.version);
-    
-    // Clean request path
-    char effective_path[256];
 
-    char *query = strchr(parsed_request.path, '?');
-
-    size_t len;
-
-    if (query != NULL) {
-        len = (size_t)(query - parsed_request.path);
-    } else {
-        len = strlen(parsed_request.path);
-    }
-
-    if (len >= sizeof(effective_path)) {
-        fprintf(stderr, "Path too long\n");
-        close(client_fd);
-        return;
-    }
-
-    memcpy(effective_path, parsed_request.path, len);
-    effective_path[len] = '\0';
-
-    if (strcmp(effective_path, "/") == 0) {
-        strcpy(effective_path, "/index.html");
-    }
-
-    char filepath[512];
-
-    int chars_written = snprintf(filepath, sizeof(filepath), "%s%s", WEBROOT, effective_path);
-
-    if (chars_written < 0 || (size_t)chars_written >= sizeof(filepath)) {
-        fprintf(stderr, "File path too long\n");
-        close(client_fd);
-        return;
-    }
-
+    // Resolve path
     char resolved[PATH_MAX];
-    char resolved_root[PATH_MAX];
-
-    if (realpath(WEBROOT, resolved_root) == NULL) {
-        perror("realpath webroot");
-        send_response(client_fd, 500, "text/html", "500 Internal Server Error", 25);
-        close(client_fd);
-        return;
-    }
-
-    if (realpath(filepath, resolved) == NULL) {
-        send_response(client_fd, 404, "text/html", "404 Not Found", 13);
-        close(client_fd);
-        return;
-    }
-
-    size_t root_len = strlen(resolved_root);
-
-    if (strncmp(resolved, resolved_root, root_len) != 0 ||
-        (resolved[root_len] != '\0' &&
-         resolved[root_len] != '/')) {
-        send_response(client_fd, 403, "text/html", "403 Forbidden", 13);
+    int status = resolve_path(parsed_request.path, resolved);
+    if (status != 200) {
+        send_error(client_fd, status);
         close(client_fd);
         return;
     }
@@ -190,7 +202,7 @@ void handle_connection(int client_fd) {
     // Open file
     int fd = open(resolved, O_RDONLY);
     if (fd < 0) {
-        send_response(client_fd, 404, "text/html", "404 Not Found", 13);
+        send_error(client_fd, 404);
         close(client_fd);
         return;
     }
@@ -204,7 +216,7 @@ void handle_connection(int client_fd) {
     }
     // Check if it is a regular file
     if (!S_ISREG(st.st_mode)) {
-        send_response(client_fd, 404, "text/html", "404 Not Found", 13);
+        send_error(client_fd, 404);
         close(fd);
         close(client_fd);
         return;
