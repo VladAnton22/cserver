@@ -25,6 +25,8 @@ const char *reason_phrase(int code) {
             return "Forbidden";
         case 404:
             return "Not Found";
+        case 413:
+            return "Payload Too Large";
         case 500:
             return "Internal Server Error";
         default:
@@ -144,6 +146,9 @@ void send_error(int client_fd, int status_code) {
     case 404:
         send_response(client_fd, 404, "text/html", "<h1>404 Not Found</h1>", 22);
         return;
+    case 413:
+        send_response(client_fd, 413, "text/html", "<h1>413 Payload Too Large</h1>", 30);
+        return;
     case 500:
         send_response(client_fd, 500, "text/html", "<h1>500 Internal Server Error</h1>", 34);
         return;
@@ -153,24 +158,56 @@ void send_error(int client_fd, int status_code) {
     }
 }
 
-void handle_connection(int client_fd) {
-    char buf[4096];
-    ssize_t n = read(client_fd, buf, sizeof(buf) - 1);
-    
-    // Check data from read
-    if (n < 0) {
-        perror("read"); 
-        close(client_fd);
-        return;
-    } 
-    else if (n == 0) {
-        close(client_fd); return;
+char *scan_segment(const char *buffer, size_t total) {
+    for (size_t i = 0; i + 3 < total; i++) {
+        if (buffer[i] == '\r' &&
+            buffer[i+1] == '\n' &&
+            buffer[i+2] == '\r' &&
+            buffer[i+3] == '\n') {
+
+            return (char *)&buffer[i];
+            }
     }
 
-    buf[n] = '\0';  // add null terminator to the end of the message
+    return NULL;
+}
+
+void handle_connection(int client_fd) {
+    char buf[4096];
+    size_t total = 0;
+    char *end = NULL;
+    while (total < sizeof(buf) - 1) {
+        ssize_t n = read(client_fd, buf + total, sizeof(buf) - 1 - total);
+        
+        // Check data from read
+        if (n < 0) {
+            perror("read"); 
+            close(client_fd);
+            return;
+        } 
+        else if (n == 0) {
+            close(client_fd); return;
+        }
+
+        total += n;
+
+        end = scan_segment(buf, total);
+
+        if (end != NULL) {
+            break;
+        }
+    }
+
+    if (end == NULL) {
+        send_error(client_fd, 413);
+        close(client_fd);
+        return;
+    }
+
+    buf[total] = '\0';  // add null terminator to the end of the message
 
     struct request parsed_request = {0};
-    int parse_status = parse(buf, n, &parsed_request);
+    int parse_status = parse(buf, total, &parsed_request);
     if (parse_status != 200) {
         send_error(client_fd, parse_status);
         close(client_fd);
