@@ -47,7 +47,7 @@ const char *mime_type(const char *path) {
     if (strcmp(dot, ".css") == 0) return "text/css";
     if (strcmp(dot, ".js") == 0) return "text/javascript";
     if (strcmp(dot, ".png") == 0) return "image/png";
-    if (strcmp(dot, ".jpg") == 0) return "image/jpg";
+    if (strcmp(dot, ".jpeg") == 0) return "image/jpg";
     if (strcmp(dot, ".jpeg") == 0) return "image/jpeg";
     if (strcmp(dot, ".svg") == 0) return "image/svg+xml";
     if (strcmp(dot, ".gif") == 0) return "image/gif";
@@ -311,8 +311,7 @@ int main(void) {
     }
 
     printf("Listening on http://localhost:%d\n", PORT);
-
-    // TODO: single read assumes whole request arrived - fix in Part 6
+    
     for (;;) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);

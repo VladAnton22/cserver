@@ -47,11 +47,15 @@ The solution is IO Multiplexing. There are 3 options: `select`, `poll`, and `epo
 
 The tradeoff to using just `epoll` on a single threaded loop, is that there is no CPU parallelism. Any handler that blocks stalls *every* connection.
 
+**Note**: epoll not implemented yet !! Only planned
+
 ### How are partial reads handled?
 
 TCP is a byte stream, meaning that `read()` will gives you whatever bytes have arrived. Non blocking sockets sharpen this, when nothing more has arrived yet you get `EAGAIN`/`EWOULDBLOCK`.
 
 This is why we need a per-connection state machine. Each connection owns a buffer, we append whatever we read and scan for the end-of-headers marker `\r\n\r\n`. Until we see it we stay in `READING_HEADERS`. Once headers are read, we parse `Content-Length` and if there is a body stay in `READING_BODY` until we have accummulated that many bytes, then `WRITING`, then `DONE`.
+
+**Note**: Non blocking sockets not done yet!! Only planned
 
 ### Security notes
 
