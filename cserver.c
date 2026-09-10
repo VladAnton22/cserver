@@ -9,10 +9,14 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <linux/limits.h>
+#include <errno.h>
+#include <sys/epoll.h>
+
 #include "http_parser.h"
 
 #define PORT 8080
 #define BACKLOG 16
+#define MAX_EVENTS 64
 #define WEBROOT "./www"
 
 const char *reason_phrase(int code) {
@@ -47,7 +51,7 @@ const char *mime_type(const char *path) {
     if (strcmp(dot, ".css") == 0) return "text/css";
     if (strcmp(dot, ".js") == 0) return "text/javascript";
     if (strcmp(dot, ".png") == 0) return "image/png";
-    if (strcmp(dot, ".jpeg") == 0) return "image/jpg";
+    if (strcmp(dot, ".jpg") == 0) return "image/jpeg";
     if (strcmp(dot, ".jpeg") == 0) return "image/jpeg";
     if (strcmp(dot, ".svg") == 0) return "image/svg+xml";
     if (strcmp(dot, ".gif") == 0) return "image/gif";
@@ -284,6 +288,69 @@ void handle_connection(int client_fd) {
     close(client_fd);
 }
 
+int make_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL);
+
+    if (flags == -1)
+        return -1;
+
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1)
+        return -1;
+    
+    return 0;
+}
+
+void accept_new_connections(int epollfd, int listen_fd) {
+    for(;;) {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &client_len);
+        if (client_fd == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return;
+            }
+            else {
+                perror("accept");
+                return;
+            }
+        }
+        if (make_nonblocking(client_fd) < 0) {
+            perror("fcntl");
+            close(client_fd);
+            return;
+        }
+        struct epoll_event ev;
+        ev.events = EPOLLIN;
+        ev.data.fd = client_fd;
+        if (epoll_ctl(epollfd, EPOLL_CTL_ADD, client_fd, &ev) == -1) {
+            perror("epoll_ctl: client_fd");
+            close(client_fd);
+            return;
+        }
+        printf("registered client fd %d\n", client_fd);
+    }
+}
+
+void handle_client(int fd) {
+        char buf[4096];
+        ssize_t nread = read(fd, buf, sizeof(buf));
+        if (nread > 0) {
+            printf("fd %d: %.*s\n", fd, (int)nread, buf);
+        }
+        else if (nread == 0) {
+            close(fd);
+        }
+        else {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return;
+            }
+            else {
+                perror("read");
+                close(fd);
+            }
+        }
+}
+
 int main(void) {
     // Create TCP socket (IPv4, stream = TCP)
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -309,17 +376,47 @@ int main(void) {
     if (listen(listen_fd, BACKLOG) < 0) {
         perror("listen"); exit(1);
     }
+    if (make_nonblocking(listen_fd) < 0) {
+        perror("fcntl"); exit(1);
+    }
 
     printf("Listening on http://localhost:%d\n", PORT);
+
+    // Create epoll instance and events struct
+    int epollfd = epoll_create1(0);
+    if (epollfd < 0) {
+        perror("epoll_create1");
+        exit(1);
+    }
+    struct epoll_event events[MAX_EVENTS];
+
+    // Register the listen socket
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.fd = listen_fd;
+    if (epoll_ctl(epollfd, EPOLL_CTL_ADD, listen_fd, &ev) < 0) {
+        perror("epoll_ctl: listen_fd");
+        exit(1);
+    }
     
+    int nfds;
     for (;;) {
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        int client_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &client_len);
-        if (client_fd < 0) {
-            perror("accept"); continue;
+        // Block to get ready fds
+        nfds = epoll_wait(epollfd, events, MAX_EVENTS, -1);
+        if (nfds < 0) {
+            perror("epoll_wait");
+            exit(1);
         }
-        handle_connection(client_fd);
+
+        for (int n = 0; n < nfds; ++n) {
+            if (events[n].data.fd == listen_fd) {
+                accept_new_connections(epollfd, listen_fd);
+            }
+            else {
+                int fd = events[n].data.fd;
+                handle_client(fd);
+            }
+        }
     }
 
     close(listen_fd);

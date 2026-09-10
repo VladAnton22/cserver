@@ -1,6 +1,5 @@
 #!/bin/bash
 
-
 pass=0
 fail=0
 
@@ -35,7 +34,7 @@ check_ctype() {
         pass=$((pass + 1))
     else
         fail=$((fail + 1))
-        echo "FAIL: $label — expected content-type $expected, got '$ctype'"
+        echo "FAIL: $label - expected content-type $expected, got '$ctype'"
     fi
 }
 
