@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -18,6 +19,22 @@
 #define BACKLOG 16
 #define MAX_EVENTS 64
 #define WEBROOT "./www"
+
+enum state {
+    READING_HEADERS, READING_BODY, WRITING
+};
+struct connection {
+    int fd;
+    enum state state;
+    char read_buf[8192];
+    size_t read_len;
+    struct request request;
+    size_t content_length;
+    size_t body_received;
+    char *write_buf;
+    size_t write_len;
+    size_t write_sent;
+};
 
 const char *reason_phrase(int code) {
     switch (code) {
@@ -176,118 +193,6 @@ char *scan_segment(const char *buffer, size_t total) {
     return NULL;
 }
 
-void handle_connection(int client_fd) {
-    char buf[4096];
-    size_t total = 0;
-    char *end = NULL;
-    while (total < sizeof(buf) - 1) {
-        ssize_t n = read(client_fd, buf + total, sizeof(buf) - 1 - total);
-        
-        // Check data from read
-        if (n < 0) {
-            perror("read"); 
-            close(client_fd);
-            return;
-        } 
-        else if (n == 0) {
-            close(client_fd); return;
-        }
-
-        total += n;
-
-        end = scan_segment(buf, total);
-
-        if (end != NULL) {
-            break;
-        }
-    }
-
-    if (end == NULL) {
-        send_error(client_fd, 413);
-        close(client_fd);
-        return;
-    }
-
-    buf[total] = '\0';  // add null terminator to the end of the message
-
-    struct request parsed_request = {0};
-    int parse_status = parse(buf, total, &parsed_request);
-    if (parse_status != 200) {
-        send_error(client_fd, parse_status);
-        close(client_fd);
-        return;
-    }
-
-    printf("%s %s %s\n", parsed_request.method, parsed_request.path, parsed_request.version);
-
-    // Resolve path
-    char resolved[PATH_MAX];
-    int status = resolve_path(parsed_request.path, resolved);
-    if (status != 200) {
-        send_error(client_fd, status);
-        close(client_fd);
-        return;
-    }
-
-    // Open file
-    int fd = open(resolved, O_RDONLY);
-    if (fd < 0) {
-        send_error(client_fd, 404);
-        close(client_fd);
-        return;
-    }
-
-    struct stat st;
-    if (fstat(fd, &st) < 0) {
-        perror("fstat");
-        close(fd);
-        close(client_fd);
-        return;
-    }
-    // Check if it is a regular file
-    if (!S_ISREG(st.st_mode)) {
-        send_error(client_fd, 404);
-        close(fd);
-        close(client_fd);
-        return;
-    }
-
-    // Read file
-    char *filebuf = malloc(st.st_size);
-    if (filebuf == NULL) {
-        perror("malloc");
-        close(fd);
-        close(client_fd);
-        return;
-    }
-
-    size_t total_read = 0;
-
-    while(total_read < (size_t)st.st_size) {
-        ssize_t bytes = read(fd, filebuf + total_read, st.st_size - total_read);
-        if (bytes < 0) {
-            perror("read");
-            break;
-        }
-        if (bytes == 0) {
-            break;
-        }
-        total_read += bytes;
-    }
-    if (total_read != (size_t)st.st_size) {
-        fprintf(stderr, "incomplete read of %s\n", resolved);
-        free(filebuf);
-        close(fd);
-        close(client_fd);
-        return;
-    }
-
-    send_response(client_fd, 200, mime_type(resolved), filebuf, st.st_size);
-    free(filebuf);
-    close(fd);
-    close(client_fd);
-}
-
 int make_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL);
 
@@ -304,6 +209,7 @@ void accept_new_connections(int epollfd, int listen_fd) {
     for(;;) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
+        // Accept connection
         int client_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &client_len);
         if (client_fd == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -319,36 +225,284 @@ void accept_new_connections(int epollfd, int listen_fd) {
             close(client_fd);
             return;
         }
+        // Initialise connection struct to 0
+        struct connection *conn = calloc(1, sizeof(struct connection));
+        if (conn == NULL) {
+            perror("calloc");
+            close(client_fd);
+            return;
+        }
+        conn->fd = client_fd;
+        conn->state = READING_HEADERS;
+
         struct epoll_event ev;
         ev.events = EPOLLIN;
-        ev.data.fd = client_fd;
+        ev.data.ptr = conn;
         if (epoll_ctl(epollfd, EPOLL_CTL_ADD, client_fd, &ev) == -1) {
             perror("epoll_ctl: client_fd");
             close(client_fd);
+            free(conn);
             return;
         }
         printf("registered client fd %d\n", client_fd);
     }
 }
 
-void handle_client(int fd) {
-        char buf[4096];
-        ssize_t nread = read(fd, buf, sizeof(buf));
-        if (nread > 0) {
-            printf("fd %d: %.*s\n", fd, (int)nread, buf);
+void close_connection(struct connection *conn) {
+    close(conn->fd);
+    free(conn->write_buf);
+    free(conn);
+    return;
+}
+
+int build_response(struct connection *conn) {
+    // Resolve path
+    char resolved[PATH_MAX];
+    int status = resolve_path(conn->request.path, resolved);
+    if (status != 200) {
+        return status;
+    }
+
+    // Open file
+    int fd = open(resolved, O_RDONLY);
+    if (fd < 0) {
+        return 404;
+    }
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        perror("fstat");
+        close(fd);
+        return 500;
+    }
+    // Check if it is a regular file
+    if (!S_ISREG(st.st_mode)) {
+        close(fd);
+        return 404;
+    }
+
+    // Build headers
+    char head[1024];
+    time_t now = time(NULL);
+    struct tm *gmt = gmtime(&now);
+
+    char date[64];
+    strftime(date, sizeof(date), "%a, %d %b %Y %H:%M:%S GMT", gmt);
+
+    int header_n = snprintf(
+        head,
+        sizeof(head),
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %zu\r\n"
+        "Date: %s\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        200,
+        reason_phrase(200),
+        mime_type(resolved),
+        st.st_size,
+        date
+    );
+    if (header_n < 0 || (size_t)header_n >= sizeof(head)) {
+        fprintf(stderr, "snprintf failed\n");
+        return 500;
+    }
+    
+    // Write headers to buffer
+    conn->write_buf = malloc(header_n + st.st_size);
+    if (conn->write_buf == NULL) {
+        close(fd);
+        return 500;
+    }
+    memcpy(conn->write_buf, head, header_n);
+
+    size_t body_read = 0;
+
+    while(body_read < (size_t)st.st_size) {
+        ssize_t bytes = read(fd, conn->write_buf + header_n + body_read, st.st_size - body_read);
+        if (bytes < 0) {
+            perror("read");
+            break;
         }
-        else if (nread == 0) {
-            close(fd);
+        if (bytes == 0) {
+            break;
         }
-        else {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return;
-            }
-            else {
-                perror("read");
-                close(fd);
-            }
+        body_read += bytes;
+    }
+    close(fd);
+    
+    if (body_read != (size_t)st.st_size) {
+        fprintf(stderr, "incomplete read of %s\n", resolved);
+        return 500;
+    } 
+    conn->write_len = header_n + st.st_size;
+    return 200;
+}
+
+void start_response(int epollfd, struct connection *conn) {
+    int status = build_response(conn);
+    if (status != 200) {
+        send_error(conn->fd, status);
+        close_connection(conn);
+        return;
+    }
+
+    conn->write_sent = 0;
+    conn->state = WRITING;
+
+    struct epoll_event ev;
+    ev.events = EPOLLOUT;
+    ev.data.ptr = conn;
+    if (epoll_ctl(epollfd, EPOLL_CTL_MOD, conn->fd, &ev) < 0) {
+        perror("epoll_ctl: mod");
+        close_connection(conn);
+        return;
+    }
+}
+
+const char *find_header(struct request *request, char *header_name) {
+    for (size_t i = 0; i < request->header_count; i++) {
+        if (strcasecmp(request->headers[i].name, header_name) == 0) {    // HTTP headers are case insensitive
+            return request->headers[i].value;
         }
+    }
+    return NULL;
+}
+
+void handle_reading_headers(int epollfd, struct connection *conn) {
+    // read into read_buf where we left off
+    ssize_t n = read(conn->fd, conn->read_buf + conn->read_len, sizeof(conn->read_buf) - 1 - conn->read_len);
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        return;
+    } else if (n < 0) {
+        close_connection(conn);
+        return;
+    }
+    else if (n == 0) {
+        close_connection(conn);
+        return;
+    }
+    conn->read_len += n;
+
+    char *end = scan_segment(conn->read_buf, conn->read_len);
+    conn->read_buf[conn->read_len] = '\0';
+    if (end == NULL) {
+        if (conn->read_len == sizeof(conn->read_buf) - 1) {
+            send_error(conn->fd, 413);
+            close_connection(conn);
+            return;
+        }
+        return;   // room left - wait for next event
+    }
+    int parse_status = parse(conn->read_buf, conn->read_len, &conn->request);
+    if (parse_status != 200) {
+        send_error(conn->fd, parse_status);
+        close_connection(conn);
+        return;
+    }
+    // Find body length to prepare for next state (READING_BODY)
+    const char *content_length = find_header(&conn->request, "Content-Length");
+    if (content_length == NULL) {
+        start_response(epollfd, conn);  // no body: go to WRITING
+        return;
+    }
+    if (content_length[0] == '-') {
+        send_error(conn->fd, 400);
+        close_connection(conn);
+        return;
+    }
+
+    // Content-Length is valid
+    errno = 0;
+    char *endptr;
+    unsigned long cl = strtoul(content_length, &endptr, 10);
+    if (endptr == content_length) {     // consumed no digits at all
+        send_error(conn->fd, 400);
+        close_connection(conn);
+        return;
+    }
+    if (*endptr != '\0') {   // leftover char after number
+        send_error(conn->fd, 400);
+        close_connection(conn);
+        return;
+    }
+    if (errno == ERANGE) {      // number overflowed
+        send_error(conn->fd, 413);
+        close_connection(conn);
+        return;
+    }
+
+    conn->content_length = cl;
+    size_t body_offset = end + 4 - conn->read_buf;
+    if (body_offset + conn->content_length > sizeof(conn->read_buf) - 1) {
+        send_error(conn->fd, 413);
+        close_connection(conn);
+        return;
+    }
+
+    conn->body_received = conn->read_len - (body_offset);
+    if (conn->body_received >= conn->content_length) {
+        start_response(epollfd, conn);
+    }
+    else {
+        conn->state = READING_BODY;
+    }
+}
+
+void handle_reading_body(int epollfd, struct connection *conn) {
+    ssize_t n = read(conn->fd, conn->read_buf + conn->read_len, sizeof(conn->read_buf) - 1 - conn->read_len);
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        return;
+    } 
+    else if (n < 0) {
+        close_connection(conn);
+        return;
+    }
+    else if (n == 0) {
+        close_connection(conn);
+        return;
+    }
+    conn->read_len += n;
+    conn->body_received += n;
+
+    if (conn->body_received >= conn->content_length) {
+        start_response(epollfd, conn);
+    }
+}
+
+void handle_writing(struct connection *conn) {
+    ssize_t n = send(conn->fd, conn->write_buf + conn->write_sent, conn->write_len - conn->write_sent, MSG_NOSIGNAL);
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        return;
+    } 
+    else if (n < 0) {
+        close_connection(conn);
+        return;
+    }
+    else if (n >= 0) {
+        conn->write_sent += n;
+    }
+    if (conn->write_sent == conn->write_len) {
+            close_connection(conn);
+            return;
+        }
+    return;
+}
+
+void handle_client(int epollfd, struct connection *conn) {
+    switch (conn->state) {
+        case READING_HEADERS: {
+            handle_reading_headers(epollfd, conn);
+            break;
+        }
+        case READING_BODY: {
+            handle_reading_body(epollfd, conn);
+            break;
+        }
+        case WRITING: {
+            handle_writing(conn);
+        }
+    }
 }
 
 int main(void) {
@@ -393,7 +547,7 @@ int main(void) {
     // Register the listen socket
     struct epoll_event ev;
     ev.events = EPOLLIN;
-    ev.data.fd = listen_fd;
+    ev.data.ptr = NULL;     // sentinel for listen socket
     if (epoll_ctl(epollfd, EPOLL_CTL_ADD, listen_fd, &ev) < 0) {
         perror("epoll_ctl: listen_fd");
         exit(1);
@@ -409,12 +563,13 @@ int main(void) {
         }
 
         for (int n = 0; n < nfds; ++n) {
-            if (events[n].data.fd == listen_fd) {
+            // Check if listen socket, else -> handle_client
+            if (events[n].data.ptr == NULL) {
                 accept_new_connections(epollfd, listen_fd);
             }
             else {
-                int fd = events[n].data.fd;
-                handle_client(fd);
+                struct connection *conn = events[n].data.ptr;
+                handle_client(epollfd, conn);
             }
         }
     }
