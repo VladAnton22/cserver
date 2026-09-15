@@ -13,8 +13,8 @@ A hand-written HTTP/1.1 server in C, built from raw sockets - no framework, no H
 - [x] Spec-valid response builder (`Content-Type`, `Content-Length`, `Date`, `Connection`)
 - [x] Static file serving with an extension -> MIME map
 - [x] Path-traversal protection (`..` rejected -> `403`)
-- [ ] Single-threaded `epoll` event loop for concurrent connections
-- [ ] Non-blocking I/O with a per-connection state machine (handles partial reads)
+- [x] Single-threaded `epoll` event loop for concurrent connections
+- [x] Non-blocking I/O with a per-connection state machine (handles partial reads)
 - [ ] JSON API layer (`/api/health`, `/api/echo`, `/api/kv`)
 - [ ] Test suite + benchmarks
 
