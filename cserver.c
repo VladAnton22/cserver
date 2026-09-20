@@ -19,6 +19,7 @@
 #define BACKLOG 16
 #define MAX_EVENTS 64
 #define WEBROOT "./www"
+#define MAX_FILE_SIZE (8 * 1024 * 1024)
 
 enum state {
     READING_HEADERS, READING_BODY, WRITING
@@ -117,68 +118,6 @@ int resolve_path(const char *request_path, char *resolved_out) {
     return 200;
 }
 
-void send_response(int client_fd,
-                   int status_code,
-                   const char *content_type,
-                   const char *body,
-                   size_t body_len
-) {
-    char head[1024];
-    time_t now = time(NULL);
-    struct tm *gmt = gmtime(&now);
-
-    char date[64];
-    strftime(date, sizeof(date), "%a, %d %b %Y %H:%M:%S GMT", gmt);
-
-    int n = snprintf(
-        head,
-        sizeof(head),
-        "HTTP/1.1 %d %s\r\n"
-        "Content-Type: %s\r\n"
-        "Content-Length: %zu\r\n"
-        "Date: %s\r\n"
-        "Connection: close\r\n"
-        "\r\n",
-        status_code,
-        reason_phrase(status_code),
-        content_type,
-        body_len,
-        date
-    );
-
-    if (n < 0 || (size_t)n >= sizeof(head)) {
-        fprintf(stderr, "snprintf failed\n");
-        return;
-    }
-
-    send(client_fd, head, n, 0);
-    send(client_fd, body, body_len, 0);
-}
-
-void send_error(int client_fd, int status_code) {
-    switch (status_code)
-    {
-    case 400:
-        send_response(client_fd, 400, "text/html", "<h1>400 Bad Request</h1>", 24);
-        return;
-    case 403:
-        send_response(client_fd, 403, "text/html", "<h1>403 Forbidden</h1>", 22);
-        return;
-    case 404:
-        send_response(client_fd, 404, "text/html", "<h1>404 Not Found</h1>", 22);
-        return;
-    case 413:
-        send_response(client_fd, 413, "text/html", "<h1>413 Payload Too Large</h1>", 30);
-        return;
-    case 500:
-        send_response(client_fd, 500, "text/html", "<h1>500 Internal Server Error</h1>", 34);
-        return;
-    default:
-        send_response(client_fd, status_code, "text/html", "<h1>Unknown Error</h1>", 22);
-        return;
-    }
-}
-
 char *scan_segment(const char *buffer, size_t total) {
     for (size_t i = 0; i + 3 < total; i++) {
         if (buffer[i] == '\r' &&
@@ -189,7 +128,6 @@ char *scan_segment(const char *buffer, size_t total) {
             return (char *)&buffer[i];
             }
     }
-
     return NULL;
 }
 
@@ -255,32 +193,26 @@ void close_connection(struct connection *conn) {
     return;
 }
 
-int build_response(struct connection *conn) {
-    // Resolve path
-    char resolved[PATH_MAX];
-    int status = resolve_path(conn->request.path, resolved);
-    if (status != 200) {
-        return status;
-    }
+void begin_writing(struct connection *conn, int epollfd) {
+    conn->write_sent = 0;
+    conn->state = WRITING;
 
-    // Open file
-    int fd = open(resolved, O_RDONLY);
-    if (fd < 0) {
-        return 404;
+    struct epoll_event ev;
+    ev.events = EPOLLOUT;
+    ev.data.ptr = conn;
+    if (epoll_ctl(epollfd, EPOLL_CTL_MOD, conn->fd, &ev) < 0) {
+        perror("epoll_ctl: mod");
+        close_connection(conn);
+        return;
     }
-    struct stat st;
-    if (fstat(fd, &st) < 0) {
-        perror("fstat");
-        close(fd);
-        return 500;
-    }
-    // Check if it is a regular file
-    if (!S_ISREG(st.st_mode)) {
-        close(fd);
-        return 404;
-    }
+}
 
-    // Build headers
+int queue_response(struct connection *conn, 
+                    int status,
+                    const char *content_type,
+                    const char *body,
+                    size_t body_len
+) {
     char head[1024];
     time_t now = time(NULL);
     struct tm *gmt = gmtime(&now);
@@ -288,6 +220,7 @@ int build_response(struct connection *conn) {
     char date[64];
     strftime(date, sizeof(date), "%a, %d %b %Y %H:%M:%S GMT", gmt);
 
+    // Set up headers
     int header_n = snprintf(
         head,
         sizeof(head),
@@ -297,29 +230,112 @@ int build_response(struct connection *conn) {
         "Date: %s\r\n"
         "Connection: close\r\n"
         "\r\n",
-        200,
-        reason_phrase(200),
-        mime_type(resolved),
-        st.st_size,
+        status,
+        reason_phrase(status),
+        content_type,
+        body_len,
         date
     );
+
     if (header_n < 0 || (size_t)header_n >= sizeof(head)) {
         fprintf(stderr, "snprintf failed\n");
-        return 500;
+        return -1;
     }
-    
-    // Write headers to buffer
-    conn->write_buf = malloc(header_n + st.st_size);
+
+    // Save headers and body to write buffer
+    free(conn->write_buf);
+    conn->write_buf = malloc(header_n + body_len);
     if (conn->write_buf == NULL) {
-        close(fd);
-        return 500;
+        return -1;
     }
     memcpy(conn->write_buf, head, header_n);
+    memcpy(conn->write_buf + header_n, body, body_len);
+    conn->write_len = header_n + body_len;
+    return 0;
+}
 
+void queue_error(struct connection *conn, int status, int epollfd) {
+    const char *body;
+
+    switch (status)
+    {
+    case 400:
+        body = "<h1>400 Bad Request</h1>";
+        break;
+    case 403:
+        body = "<h1>403 Forbidden</h1>";
+        break;
+    case 404:
+        body = "<h1>404 Not Found</h1>";
+        break;
+    case 413:
+        body = "<h1>413 Payload Too Large</h1>";
+        break;
+    case 500:
+        body = "<h1>500 Internal Server Error</h1>";
+        break;
+    default:
+        body = "<h1>Unknown Error</h1>";
+        break;
+    }
+
+    int response_status = queue_response(conn, status, "text/html", body, strlen(body));
+    if (response_status != 0) {
+        fprintf(stderr, "queue_response_failed\n");
+        close_connection(conn);
+        return;
+    }
+    begin_writing(conn, epollfd);
+    return;
+}
+
+void start_response(int epollfd, struct connection *conn) {
+    // Resolve path
+    char resolved[PATH_MAX];
+    int status = resolve_path(conn->request.path, resolved);
+    if (status != 200) {
+        queue_error(conn, status, epollfd);
+        return;
+    }
+
+    // Open file
+    int fd = open(resolved, O_RDONLY);
+    if (fd < 0) {
+        queue_error(conn, 404, epollfd);
+        return;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        perror("fstat");
+        close(fd);
+        queue_error(conn, 500, epollfd);
+        return ;
+    }
+    // Check if it is a regular file
+    if (!S_ISREG(st.st_mode)) {
+        close(fd);
+        queue_error(conn, 404, epollfd);
+        return;
+    }
+    // Check if file size is too big
+    if (st.st_size > MAX_FILE_SIZE) {
+        close(fd);
+        queue_error(conn, 500, epollfd);
+        return;
+    }
+
+    // Read file
     size_t body_read = 0;
+    char *body = malloc((size_t)st.st_size + 1);
+    if (body == NULL) {
+        close(fd);
+        queue_error(conn, 500, epollfd);
+        return;
+    }
 
     while(body_read < (size_t)st.st_size) {
-        ssize_t bytes = read(fd, conn->write_buf + header_n + body_read, st.st_size - body_read);
+        ssize_t bytes = read(fd, body + body_read, st.st_size - body_read);
         if (bytes < 0) {
             perror("read");
             break;
@@ -332,32 +348,21 @@ int build_response(struct connection *conn) {
     close(fd);
     
     if (body_read != (size_t)st.st_size) {
-        fprintf(stderr, "incomplete read of %s\n", resolved);
-        return 500;
-    } 
-    conn->write_len = header_n + st.st_size;
-    return 200;
-}
-
-void start_response(int epollfd, struct connection *conn) {
-    int status = build_response(conn);
-    if (status != 200) {
-        send_error(conn->fd, status);
-        close_connection(conn);
+        free(body);
+        queue_error(conn, 500, epollfd);
         return;
     }
 
-    conn->write_sent = 0;
-    conn->state = WRITING;
+    int response_status = queue_response(conn, 200, mime_type(resolved), body, st.st_size);
+    free(body);
 
-    struct epoll_event ev;
-    ev.events = EPOLLOUT;
-    ev.data.ptr = conn;
-    if (epoll_ctl(epollfd, EPOLL_CTL_MOD, conn->fd, &ev) < 0) {
-        perror("epoll_ctl: mod");
-        close_connection(conn);
+    if (response_status != 0) {
+        queue_error(conn, 500, epollfd);
         return;
     }
+
+    begin_writing(conn, epollfd);
+    return;
 }
 
 const char *find_header(struct request *request, char *header_name) {
@@ -388,16 +393,14 @@ void handle_reading_headers(int epollfd, struct connection *conn) {
     conn->read_buf[conn->read_len] = '\0';
     if (end == NULL) {
         if (conn->read_len == sizeof(conn->read_buf) - 1) {
-            send_error(conn->fd, 413);
-            close_connection(conn);
+            queue_error(conn, 413, epollfd);
             return;
         }
         return;   // room left - wait for next event
     }
     int parse_status = parse(conn->read_buf, conn->read_len, &conn->request);
     if (parse_status != 200) {
-        send_error(conn->fd, parse_status);
-        close_connection(conn);
+        queue_error(conn, parse_status, epollfd);
         return;
     }
     // Find body length to prepare for next state (READING_BODY)
@@ -407,8 +410,7 @@ void handle_reading_headers(int epollfd, struct connection *conn) {
         return;
     }
     if (content_length[0] == '-') {
-        send_error(conn->fd, 400);
-        close_connection(conn);
+        queue_error(conn, 400, epollfd);
         return;
     }
 
@@ -417,26 +419,22 @@ void handle_reading_headers(int epollfd, struct connection *conn) {
     char *endptr;
     unsigned long cl = strtoul(content_length, &endptr, 10);
     if (endptr == content_length) {     // consumed no digits at all
-        send_error(conn->fd, 400);
-        close_connection(conn);
+        queue_error(conn, 400, epollfd);
         return;
     }
     if (*endptr != '\0') {   // leftover char after number
-        send_error(conn->fd, 400);
-        close_connection(conn);
+        queue_error(conn, 413, epollfd);
         return;
     }
     if (errno == ERANGE) {      // number overflowed
-        send_error(conn->fd, 413);
-        close_connection(conn);
+        queue_error(conn, 413, epollfd);
         return;
     }
 
     conn->content_length = cl;
     size_t body_offset = end + 4 - conn->read_buf;
     if (body_offset + conn->content_length > sizeof(conn->read_buf) - 1) {
-        send_error(conn->fd, 413);
-        close_connection(conn);
+        queue_error(conn, 413, epollfd);
         return;
     }
 
